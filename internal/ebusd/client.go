@@ -164,7 +164,8 @@ func (c *Client) Write(ctx context.Context, circuit, name, value string) error {
 	if _, err := check(out); err != nil {
 		return err
 	}
-	if o := strings.TrimSpace(out); o != "done" && o != "" {
+	// ebusd answers "empty" when the slave ACKs without data (e.g. VRC 700 timers).
+	if o := strings.TrimSpace(out); o != "done" && o != "empty" && o != "" {
 		return &Error{Msg: "unerwartete Antwort: " + o}
 	}
 	return nil
