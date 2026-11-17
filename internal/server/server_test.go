@@ -191,6 +191,9 @@ func TestCatalogConsistency(t *testing.T) {
 				if it.AllowWrite && it.Kind == "number" && (it.Min == nil || it.Max == nil || it.Step == nil) {
 					t.Errorf("%s writable number without range", id)
 				}
+				if it.Level == "installer" && it.Help == "" {
+					t.Errorf("%s installer item without help", id)
+				}
 			}
 		}
 	}
