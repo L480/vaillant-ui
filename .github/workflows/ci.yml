@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint & test (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: node --check web/app.js
+        run: cp web/app.js /tmp/app.mjs && node --check /tmp/app.mjs
+
+  e2e:
+    name: Browser E2E (Playwright, fake ebusd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          go build -o /tmp/vaillant-ui .
+          go build -o /tmp/fakeebusd ./cmd/fakeebusd
+      - name: Run E2E
+        run: |
+          /tmp/fakeebusd -listen 127.0.0.1:18888 > /tmp/fake.log 2>&1 &
+          EBUSD_ADDR=127.0.0.1:18888 LISTEN=127.0.0.1:8098 /tmp/vaillant-ui > /tmp/rw.log 2>&1 &
+          EBUSD_ADDR=127.0.0.1:18888 LISTEN=127.0.0.1:8099 READONLY=1 /tmp/vaillant-ui > /tmp/ro.log 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:8098/healthz && curl -fsS http://127.0.0.1:8099/healthz && break; sleep 0.5; done
+          mkdir -p /tmp/shots
+          docker run --rm --network host -v "${PWD}/e2e:/e2e:ro" -v /tmp/shots:/shots \
+            mcr.microsoft.com/playwright/python:v1.56.0-noble \
+            sh -c 'pip install -q --break-system-packages playwright==1.56.0 && python3 /e2e/e2e.py http://127.0.0.1:8098 --readonly http://127.0.0.1:8099 --shots /shots'
+      - if: failure()
+        run: tail -n 50 /tmp/fake.log /tmp/rw.log /tmp/ro.log
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-screenshots
+          path: /tmp/shots
+          retention-days: 7
+          if-no-files-found: ignore
+
+  docker:
+    name: Docker build (smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build all platforms (cross-compiled, no QEMU)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v8
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vaillant-ui:ci
+          cache-from: type=gha
+      - name: Scan the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: vaillant-ui:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Smoke test
+        run: |
+          trap 'docker logs vaillant-ui-ci; docker rm -f vaillant-ui-ci' EXIT
+          docker run -d --name vaillant-ui-ci \
+            --read-only --cap-drop=ALL --security-opt no-new-privileges \
+            -p 8080:80 -e EBUSD_ADDR=127.0.0.1:9 vaillant-ui:ci
+          for _ in $(seq 1 20); do curl -fsS http://localhost:8080/healthz && break; sleep 0.5; done
+          curl -fsS http://localhost:8080/ | grep -q '<title>Vaillant Heizungssteuerung</title>'
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/meta)
+          test "${code}" = "502"
+          docker exec vaillant-ui-ci /vaillant-ui -healthcheck
+          test "$(docker inspect -f '{{.Config.User}}' vaillant-ui-ci)" = "6000"
+
+  hadolint:
+    name: Hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+  trivy:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: sarif
+          output: trivy-results.sarif
+      # SARIF upload needs a public repo or GitHub Advanced Security.
+      - if: always() && !github.event.repository.private
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-results.sarif
