@@ -130,6 +130,9 @@ select{max-width:100%}
 .quick{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px}
 .quick .btn{min-height:48px}
 .quick .btn.active{background:var(--primary);color:var(--on-primary);border-color:var(--primary)}
+.quick .btn.dirty{background:var(--primary-soft);color:var(--primary);border-color:var(--primary)}
+.quick .actions{display:flex;gap:8px;justify-content:flex-end}
+.quick .actions .btn{min-height:0}
 .center{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .status{font-size:.8125rem;color:var(--muted);text-align:center;margin:8px 0}
 

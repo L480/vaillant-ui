@@ -135,16 +135,12 @@ function makeRow(item, o = {}) {
   function setDraft(v, rerender = true) {
     draft = v;
     dirty = !eq(v, cur);
-    if (o.instant && dirty && (item.kind === 'enum' || item.kind === 'bool')) return save();
     if (rerender) paintCtl();
     paintActions();
   }
   function cancel() { dirty = false; draft = cur; paintCtl(); paintActions(); }
   async function save() {
-    if (item.level === 'installer' && !(await confirmBox('Fachhandwerker-Einstellung', `Achtung: „${item.label || item.id}“ ist eine Fachhandwerker-Einstellung. Falsche Werte können die Anlage beschädigen oder den Betrieb stören. Wirklich ändern?`, 'Ja, ändern', true))) {
-      if (o.instant) cancel();
-      return;
-    }
+    if (item.level === 'installer' && !(await confirmBox('Fachhandwerker-Einstellung', `Achtung: „${item.label || item.id}“ ist eine Fachhandwerker-Einstellung. Falsche Werte können die Anlage beschädigen oder den Betrieb stören. Wirklich ändern?`, 'Ja, ändern', true))) return;
     saving = true; paintCtl(); paintActions();
     try {
       const r = await api('/api/values/' + encodeURIComponent(item.id), { method: 'PUT', body: JSON.stringify({ value: draft }) });
@@ -153,7 +149,6 @@ function makeRow(item, o = {}) {
       if (o.onSaved) o.onSaved(item, r);
     } catch (e) {
       toast(e.message || 'Fehler beim Speichern', 'err');
-      if (o.instant) { dirty = false; draft = cur; }
     }
     saving = false; paintCtl(); paintActions();
   }
@@ -594,7 +589,7 @@ function renderOverview(view) {
 
   const rows = new Map();
   const mk = (id, o) => { if (!id) return null; const r = makeRow(itemOf(id), { onSaved: refreshAfter, ...o }); rows.set(id, r); return r; };
-  const opRow = mk(opId, { label: 'Betriebsart', instant: true });
+  const opRow = mk(opId, { label: 'Betriebsart' });
   const dayRow = mk(dayId, { label: 'Wunschtemperatur Tag', big: true });
   const nightRow = mk(nightId, { label: 'Absenktemperatur', big: true });
   const vetoRow = mk(vetoId, { label: 'Temperatur bei „Manuell“' });
@@ -602,19 +597,27 @@ function renderOverview(view) {
   if (sfId) {
     const it = itemOf(sfId);
     sfBox = h('div', { class: 'quick' });
-    sf = { cur: undefined };
+    sf = { cur: undefined, pend: undefined, saving: false };
     const sfOff = S.meta.readonly || !it.writable;
-    const send = async (val) => {
-      if (sfOff) return;
-      try { await api('/api/values/' + encodeURIComponent(sfId), { method: 'PUT', body: JSON.stringify({ value: val }) }); toast('Gespeichert', 'ok'); sf.cur = val; paintSf(); refreshAfter(); }
+    const pick = (val) => { if (sfOff || sf.saving) return; sf.pend = sf.pend === val || sf.cur === val ? undefined : val; paintSf(); };
+    const send = async () => {
+      const val = sf.pend;
+      if (sfOff || val === undefined || sf.saving) return;
+      sf.saving = true; paintSf();
+      try { await api('/api/values/' + encodeURIComponent(sfId), { method: 'PUT', body: JSON.stringify({ value: val }) }); toast('Gespeichert', 'ok'); sf.cur = val; sf.pend = undefined; refreshAfter(); }
       catch (e) { toast(e.message, 'err'); }
+      sf.saving = false; paintSf();
     };
     var paintSf = () => {
       clear(sfBox);
       if (sf.cur === undefined) return sfBox.append(skeleton(160));
       const opts = (it.options || []).filter((o) => o.value !== 'auto' && (o.value !== 'load' || features().hwc));
-      for (const o of opts) sfBox.append(h('button', { class: 'btn' + (sf.cur === o.value ? ' active' : ''), 'data-testid': 'sf-' + o.value, disabled: sfOff, onclick: () => send(o.value) }, o.label));
-      if (sf.cur !== 'auto' && sf.cur != null) sfBox.append(h('button', { class: 'btn primary', 'data-testid': 'sf-auto', style: 'grid-column:1/-1', disabled: sfOff, onclick: () => send('auto') }, 'Beenden'));
+      const sel = (v) => sf.pend === v ? ' dirty' : '';
+      for (const o of opts) sfBox.append(h('button', { class: 'btn' + (sf.cur === o.value && sf.pend === undefined ? ' active' : '') + sel(o.value), 'data-testid': 'sf-' + o.value, disabled: sfOff || sf.saving, onclick: () => pick(o.value) }, o.label));
+      if (sf.cur !== 'auto' && sf.cur != null) sfBox.append(h('button', { class: 'btn primary' + sel('auto'), 'data-testid': 'sf-auto', style: 'grid-column:1/-1', disabled: sfOff || sf.saving, onclick: () => pick('auto') }, 'Beenden'));
+      if (sf.pend !== undefined) sfBox.append(h('div', { class: 'actions', style: 'grid-column:1/-1' },
+        h('button', { class: 'btn small', 'data-testid': 'sf-cancel', disabled: sf.saving, onclick: () => { sf.pend = undefined; paintSf(); } }, 'Abbrechen'),
+        h('button', { class: 'btn small primary', 'data-testid': 'sf-save', disabled: sf.saving, onclick: send }, sf.saving ? 'Speichern …' : 'Speichern')));
     };
     paintSf();
   }
@@ -654,7 +657,7 @@ function renderOverview(view) {
       }
       clear(heroChip).append(icon('flame', 18), flameOn == null ? 'Brenner —' : flameOn ? 'Brenner an' : 'Brenner aus');
       for (const [id, r] of rows) r.set(R(id));
-      if (sf) { sf.cur = R(sfId).error ? undefined : R(sfId).value; paintSf(); }
+      if (sf) { sf.cur = R(sfId).error ? undefined : R(sfId).value; if (sf.cur === sf.pend) sf.pend = undefined; paintSf(); }
       clear(status).append('Aktualisiert ' + new Date().toLocaleTimeString('de-DE') + ' ', h('button', { class: 'linkbtn', onclick: () => refresh(true) }, 'Neu lesen'));
     } else {
       clear(status).append('Lesefehler: ' + v.reason.message + ' ', h('button', { class: 'linkbtn', onclick: () => refresh(true) }, 'Erneut versuchen'));
@@ -666,7 +669,7 @@ function renderOverview(view) {
       banner.append(h('a', { class: 'banner danger', href: '#/fehler', style: 'text-decoration:none;color:inherit' }, icon('warning'),
         h('span', { class: 'grow' }, e.value.current.map((x) => x.text || `Fehler ${x.code}`).join(' · ')), 'Details'));
   }
-  const timer = setInterval(() => { if (!document.hidden && ![...rows.values()].some((r) => r.dirty)) refresh(); }, 15000);
+  const timer = setInterval(() => { if (!document.hidden && ![...rows.values()].some((r) => r.dirty) && !(sf && sf.pend !== undefined)) refresh(); }, 15000);
   const vis = () => { if (!document.hidden) refresh(); };
   document.addEventListener('visibilitychange', vis);
   cleanup = () => { clearInterval(timer); document.removeEventListener('visibilitychange', vis); };

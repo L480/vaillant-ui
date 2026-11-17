@@ -32,11 +32,7 @@ def tid(page, t):
 
 def save_if_needed(page, item):
     page.wait_for_timeout(400)
-    btn = tid(page, f"save-{item}").first
-    try:
-        btn.click(timeout=1500)
-    except Exception:
-        pass  # instant-save control
+    tid(page, f"save-{item}").first.click(timeout=5000)
 
 
 def confirm_if_shown(page):
@@ -87,11 +83,33 @@ def run(p, vp, label):
     save_if_needed(page, "700.z1DayTemp")
     wait_toast(page)
 
+    puts = []
+    page.on("request", lambda r: r.method == "PUT" and puts.append(r.url))
+    tid(page, "opt-700.OpMode-night").first.click()
+    page.wait_for_timeout(500)
+    check(L("OpMode tap alone: no PUT"), not puts and api(BASE, "700.OpMode")["700.OpMode"] == "auto", str(puts))
+    tid(page, "cancel-700.OpMode").first.click()
+    check(L("OpMode cancel hides save"), tid(page, "save-700.OpMode").count() == 0)
+
     tid(page, "sf-party").first.click()
+    page.wait_for_timeout(500)
+    check(L("Schnellwahl tap alone: no PUT"), not puts and api(BASE, "700.SFMode")["700.SFMode"] == "auto", str(puts))
+    expect(tid(page, "sf-save").first).to_be_visible()
+    tid(page, "sf-cancel").first.click()
+    page.wait_for_timeout(300)
+    check(L("Schnellwahl cancel"), tid(page, "sf-save").count() == 0 and not puts and api(BASE, "700.SFMode")["700.SFMode"] == "auto")
+    tid(page, "sf-party").first.click()
+    tid(page, "sf-party").first.click()
+    check(L("Schnellwahl re-tap clears"), tid(page, "sf-save").count() == 0)
+    tid(page, "sf-party").first.click()
+    tid(page, "sf-save").first.click()
     confirm_if_shown(page)
-    page.wait_for_timeout(1500)
+    wait_toast(page)
     check(L("Schnellwahl party"), api(BASE, "700.SFMode")["700.SFMode"] == "party")
     tid(page, "sf-auto").first.click()
+    page.wait_for_timeout(500)
+    check(L("Beenden tap alone: no write"), api(BASE, "700.SFMode")["700.SFMode"] == "party")
+    tid(page, "sf-save").first.click()
     confirm_if_shown(page)
     page.wait_for_timeout(1500)
     check(L("Schnellwahl beenden"), api(BASE, "700.SFMode")["700.SFMode"] == "auto")
