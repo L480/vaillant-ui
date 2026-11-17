@@ -147,6 +147,9 @@ func (s *Server) handle(args []string) string {
 		}
 		s.Values[key] = rest[1]
 		s.Writes = append(s.Writes, key+"="+rest[1])
+		if strings.Contains(rest[0], "Timer.") {
+			return "empty"
+		}
 		return "done"
 	}
 	return "ERR: command not found"
