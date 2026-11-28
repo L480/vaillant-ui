@@ -33,6 +33,13 @@ type Server struct {
 	refreshMu sync.Mutex
 	meta      *Meta
 	metaAt    time.Time
+
+	pollEvery time.Duration
+	settle    time.Duration
+	enfMu     sync.Mutex
+	enfCancel context.CancelFunc
+	enfDone   chan struct{}
+	enfWG     sync.WaitGroup
 }
 
 type Meta struct {
@@ -61,9 +68,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /status", s.legacyStatus)
 	mux.HandleFunc("GET /pump-status", s.legacyPump)
+	mux.HandleFunc("POST /on", s.legacyOpMode("auto", "off", "Heizung ist nun eingeschaltet."))
+	mux.HandleFunc("POST /off", s.legacyOpMode("off", "auto", "Heizung ist nun ausgeschaltet."))
 	for path, a := range map[string][3]string{
-		"/on":          {"OpMode", "auto", "Heizung ist nun eingeschaltet."},
-		"/off":         {"OpMode", "off", "Heizung ist nun ausgeschaltet."},
 		"/auto":        {"SFMode", "auto", "Heizung ist nun im Automodus."},
 		"/party":       {"SFMode", "party", "Heizung ist nun im Partymodus."},
 		"/ventilation": {"SFMode", "ventilation", "Heizung ist nun im Lüftungsmodus."},
@@ -475,11 +482,30 @@ func (s *Server) legacyStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Es ist ein Fehler aufgetreten.", 500)
 		return
 	}
-	if strings.TrimSpace(raw) == "off" {
-		w.Write([]byte("0"))
-	} else {
+	if strings.TrimSpace(raw) != "off" {
 		w.Write([]byte("1"))
+		return
 	}
+	v, err := s.desiredTemp(r.Context(), 30)
+	if err != nil {
+		log.Printf("legacy status: %v", err)
+	}
+	if err == nil && v > frostTemp {
+		w.Write([]byte("1"))
+	} else {
+		w.Write([]byte("0"))
+	}
+}
+
+const frostTemp = 5
+
+func (s *Server) desiredTemp(ctx context.Context, maxAge int) (float64, error) {
+	raw, err := s.Bus.Read(ctx, "700", "z1ActualRoomTempDesired", maxAge, "")
+	if err != nil {
+		return 0, err
+	}
+	f, _, _ := strings.Cut(raw, ";")
+	return strconv.ParseFloat(strings.TrimSpace(f), 64)
 }
 
 func (s *Server) legacyPump(w http.ResponseWriter, r *http.Request) {
@@ -508,6 +534,132 @@ func (s *Server) legacyWrite(name, value, msg string) http.HandlerFunc {
 			return
 		}
 		w.Write([]byte(msg))
+	}
+}
+
+func (s *Server) legacyOpMode(target, other, msg string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.ReadOnly {
+			http.Error(w, "Nur-Lese-Modus", http.StatusForbidden)
+			return
+		}
+		path := r.URL.Path
+		ctx, done := s.supersede()
+		log.Printf("write 700 OpMode = %q (legacy %s from %s)", target, path, r.RemoteAddr)
+		if err := s.Bus.Write(r.Context(), "700", "OpMode", target); err != nil {
+			log.Printf("legacy write failed: %v", err)
+			done()
+			http.Error(w, "Es ist ein Fehler aufgetreten.", 500)
+			return
+		}
+		w.Write([]byte(msg))
+		s.enfWG.Add(1)
+		go func() {
+			defer s.enfWG.Done()
+			defer done()
+			s.enforce(ctx, path, target, other)
+		}()
+	}
+}
+
+// supersede cancels the running enforcement, waits for it, and registers a new one.
+func (s *Server) supersede() (context.Context, func()) {
+	s.enfMu.Lock()
+	defer s.enfMu.Unlock()
+	if s.enfCancel != nil {
+		s.enfCancel()
+		<-s.enfDone
+	}
+	settle := s.settle
+	if settle == 0 {
+		settle = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*settle+30*time.Second)
+	done := make(chan struct{})
+	s.enfCancel, s.enfDone = cancel, done
+	return ctx, func() {
+		cancel()
+		close(done)
+	}
+}
+
+// The VRC 700 can keep OpMode=off without applying it; only a real transition does.
+func (s *Server) enforce(ctx context.Context, path, target, other string) {
+	logf := func(format string, a ...any) { log.Printf("legacy %s: "+format, append([]any{path}, a...)...) }
+	start := time.Now()
+	ok, v, err := s.waitEffective(ctx, target)
+	if err != nil {
+		if ctx.Err() == nil {
+			logf("enforcement aborted: %v", err)
+		}
+		return
+	}
+	if ok {
+		logf("applied after %s", time.Since(start).Round(time.Millisecond))
+		return
+	}
+	logf("controller ignored OpMode=%s (z1ActualRoomTempDesired=%s), forcing transition via %s", target, fmtTemp(v), other)
+	if err := s.Bus.Write(ctx, "700", "OpMode", other); err != nil {
+		if ctx.Err() == nil {
+			logf("enforcement aborted: %v", err)
+		}
+		return
+	}
+	if _, _, err := s.waitEffective(ctx, other); err != nil {
+		if ctx.Err() == nil {
+			logf("enforcement aborted: %v", err)
+		}
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if err := s.Bus.Write(ctx, "700", "OpMode", target); err != nil {
+		if ctx.Err() == nil {
+			logf("enforcement aborted: %v", err)
+		}
+		return
+	}
+	ok, v, err = s.waitEffective(ctx, target)
+	switch {
+	case err != nil:
+		if ctx.Err() == nil {
+			logf("enforcement aborted: %v", err)
+		}
+	case ok:
+		logf("applied after forced transition")
+	default:
+		logf("FAILED, z1ActualRoomTempDesired still %s", fmtTemp(v))
+	}
+}
+
+func fmtTemp(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+
+func (s *Server) waitEffective(ctx context.Context, mode string) (bool, float64, error) {
+	poll, settle := s.pollEvery, s.settle
+	if poll == 0 {
+		poll = 5 * time.Second
+	}
+	if settle == 0 {
+		settle = 60 * time.Second
+	}
+	deadline := time.Now().Add(settle)
+	for {
+		select {
+		case <-ctx.Done():
+			return false, 0, ctx.Err()
+		case <-time.After(poll):
+		}
+		v, err := s.desiredTemp(ctx, -1)
+		if err != nil {
+			return false, 0, err
+		}
+		if (mode == "off") == (v <= frostTemp) {
+			return true, v, nil
+		}
+		if !time.Now().Before(deadline) {
+			return false, v, nil
+		}
 	}
 }
 

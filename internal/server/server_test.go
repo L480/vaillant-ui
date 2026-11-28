@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/L480/vaillant-ui/internal/catalog"
 	"github.com/L480/vaillant-ui/internal/ebusd"
@@ -14,6 +15,11 @@ import (
 )
 
 func setup(t *testing.T, readonly bool) (*httptest.Server, *fake.Server) {
+	ts, f, _ := setupSrv(t, readonly)
+	return ts, f
+}
+
+func setupSrv(t *testing.T, readonly bool) (*httptest.Server, *fake.Server, *Server) {
 	vals := map[string]string{
 		"700.z1DayTemp": "23", "700.OpMode": "auto", "700.SFMode": "auto",
 		"700.HolidayStartPeriod": "26.04.2023", "700.Time": "22:16:11",
@@ -22,6 +28,7 @@ func setup(t *testing.T, readonly bool) (*httptest.Server, *fake.Server) {
 		"bai.Statenumber": "8", "700.currenterror": "-;-;28;-;-", "bai.currenterror": "-;-;-;-;-",
 		"700.errorhistory#0": "0;12:10;03.01.2026;22", "700.Hc1HeatCurve": "1.1",
 		"700.z1Name1": "", "bai.StorageTemp": "-14.94;cutoff", "bai.HeatingSwitch": "on",
+		"700.z1ActualRoomTempDesired": "23",
 	}
 	for _, d := range Days {
 		vals["700.z1Timer."+d] = "05:00;22:00;-:-;-:-;-:-;-:-"
@@ -32,10 +39,32 @@ func setup(t *testing.T, readonly bool) (*httptest.Server, *fake.Server) {
 		t.Fatal(err)
 	}
 	t.Cleanup(f.Close)
-	s := &Server{Bus: ebusd.New(addr), Catalog: catalog.Build(), ReadOnly: readonly, AllowedHosts: []string{"ebus.example.org"}}
+	s := &Server{Bus: ebusd.New(addr), Catalog: catalog.Build(), ReadOnly: readonly, AllowedHosts: []string{"ebus.example.org"},
+		pollEvery: 5 * time.Millisecond, settle: 100 * time.Millisecond}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
-	return ts, f
+	return ts, f, s
+}
+
+func controller(f *fake.Server, stuck bool) {
+	f.OnWrite = func(v map[string]string, key, old, new string) {
+		if key != "700.OpMode" || stuck && old == new {
+			return
+		}
+		if new == "off" {
+			v["700.z1ActualRoomTempDesired"] = "0"
+		} else {
+			v["700.z1ActualRoomTempDesired"] = "24"
+		}
+	}
+}
+
+func status(t *testing.T, ts *httptest.Server) string {
+	c, b := do(t, "GET", ts.URL+"/status", "")
+	if c != 200 {
+		t.Fatal(c, b)
+	}
+	return b
 }
 
 func do(t *testing.T, method, url, body string, hdr ...string) (int, string) {
@@ -136,34 +165,146 @@ func TestWrites(t *testing.T) {
 }
 
 func TestLegacy(t *testing.T) {
-	ts, f := setup(t, false)
+	ts, f, srv := setupSrv(t, false)
+	controller(f, false)
+	defer srv.enfWG.Wait()
 	if c, b := do(t, "GET", ts.URL+"/status", ""); c != 200 || b != "1" {
 		t.Error(c, b)
 	}
 	if c, b := do(t, "GET", ts.URL+"/pump-status", ""); c != 200 || b != "1" {
 		t.Error(c, b)
 	}
-	if c, b := do(t, "POST", ts.URL+"/off", ""); c != 200 || b != "Heizung ist nun ausgeschaltet." || f.Values["700.OpMode"] != "off" {
+	if c, b := do(t, "POST", ts.URL+"/off", ""); c != 200 || b != "Heizung ist nun ausgeschaltet." || f.Get("700.OpMode") != "off" {
 		t.Error(c, b)
 	}
 	if c, b := do(t, "GET", ts.URL+"/status", ""); c != 200 || b != "0" {
 		t.Error(c, b)
 	}
-	if c, _ := do(t, "POST", ts.URL+"/party", ""); c != 200 || f.Values["700.SFMode"] != "party" {
+	if c, _ := do(t, "POST", ts.URL+"/party", ""); c != 200 || f.Get("700.SFMode") != "party" {
 		t.Error(c)
 	}
 }
 
+func writesOf(f *fake.Server, key string) string {
+	var out []string
+	for _, w := range f.WriteLog() {
+		if k, v, _ := strings.Cut(w, "="); k == key {
+			out = append(out, v)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+func TestLegacyNormalController(t *testing.T) {
+	ts, f, srv := setupSrv(t, false)
+	controller(f, false)
+	if c, _ := do(t, "POST", ts.URL+"/off", ""); c != 200 {
+		t.Fatal(c)
+	}
+	srv.enfWG.Wait()
+	if got := writesOf(f, "700.OpMode"); got != "off" {
+		t.Error(got)
+	}
+	if b := status(t, ts); b != "0" {
+		t.Error(b)
+	}
+}
+
+func TestLegacyStuckOff(t *testing.T) {
+	ts, f, srv := setupSrv(t, false)
+	controller(f, true)
+	f.Values["700.OpMode"], f.Values["700.z1ActualRoomTempDesired"] = "off", "24"
+	if b := status(t, ts); b != "1" {
+		t.Error(b)
+	}
+	if c, _ := do(t, "POST", ts.URL+"/off", ""); c != 200 {
+		t.Fatal(c)
+	}
+	srv.enfWG.Wait()
+	if got := writesOf(f, "700.OpMode"); got != "off,auto,off" {
+		t.Error(got)
+	}
+	if d := f.Get("700.z1ActualRoomTempDesired"); d != "0" {
+		t.Error(d)
+	}
+	if b := status(t, ts); b != "0" {
+		t.Error(b)
+	}
+}
+
+func TestLegacyStuckOn(t *testing.T) {
+	ts, f, srv := setupSrv(t, false)
+	controller(f, true)
+	f.Values["700.OpMode"], f.Values["700.z1ActualRoomTempDesired"] = "auto", "0"
+	if c, _ := do(t, "POST", ts.URL+"/on", ""); c != 200 {
+		t.Fatal(c)
+	}
+	srv.enfWG.Wait()
+	if got := writesOf(f, "700.OpMode"); got != "auto,off,auto" {
+		t.Error(got)
+	}
+	if d := f.Get("700.z1ActualRoomTempDesired"); d != "24" {
+		t.Error(d)
+	}
+	if b := status(t, ts); b != "1" {
+		t.Error(b)
+	}
+}
+
+func TestLegacyIgnoredBounded(t *testing.T) {
+	ts, f, srv := setupSrv(t, false)
+	f.Values["700.z1ActualRoomTempDesired"] = "24"
+	if c, _ := do(t, "POST", ts.URL+"/off", ""); c != 200 {
+		t.Fatal(c)
+	}
+	srv.enfWG.Wait()
+	if got := writesOf(f, "700.OpMode"); got != "off,auto,off" {
+		t.Error(got)
+	}
+	if b := status(t, ts); b != "1" {
+		t.Error(b)
+	}
+}
+
+func TestLegacySupersede(t *testing.T) {
+	ts, f, srv := setupSrv(t, false)
+	controller(f, true)
+	f.Values["700.OpMode"], f.Values["700.z1ActualRoomTempDesired"] = "auto", "24"
+	do(t, "POST", ts.URL+"/off", "")
+	do(t, "POST", ts.URL+"/on", "")
+	srv.enfWG.Wait()
+	got := writesOf(f, "700.OpMode")
+	if f.Get("700.OpMode") != "auto" || !strings.HasSuffix(got, "auto") {
+		t.Error(got)
+	}
+	if d := f.Get("700.z1ActualRoomTempDesired"); d != "24" {
+		t.Error(d)
+	}
+}
+
+func TestLegacyStatusMissingDesired(t *testing.T) {
+	ts, f := setup(t, false)
+	f.Values["700.OpMode"] = "off"
+	delete(f.Values, "700.z1ActualRoomTempDesired")
+	if b := status(t, ts); b != "0" {
+		t.Error(b)
+	}
+}
+
 func TestReadOnly(t *testing.T) {
-	ts, f := setup(t, true)
+	ts, f, srv := setupSrv(t, true)
 	if c, _ := do(t, "PUT", ts.URL+"/api/values/700.z1DayTemp", `{"value":21}`); c != 403 {
 		t.Error(c)
 	}
 	if c, _ := do(t, "POST", ts.URL+"/off", ""); c != 403 {
 		t.Error(c)
 	}
-	if len(f.Writes) != 0 {
-		t.Error(f.Writes)
+	if c, _ := do(t, "POST", ts.URL+"/on", ""); c != 403 {
+		t.Error(c)
+	}
+	srv.enfWG.Wait()
+	if w := f.WriteLog(); len(w) != 0 {
+		t.Error(w)
 	}
 	_, body := do(t, "GET", ts.URL+"/api/catalog", "")
 	if strings.Contains(body, `"writable":true`) {
