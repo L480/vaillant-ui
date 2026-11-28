@@ -15,7 +15,21 @@ type Server struct {
 	Writes []string          // "circuit.name=value"
 	// Writable limits find -w and write to these keys; nil allows every key in Values.
 	Writable map[string]bool
-	ln       net.Listener
+	// OnWrite runs under the server lock after a write stored the value.
+	OnWrite func(values map[string]string, key, old, new string)
+	ln      net.Listener
+}
+
+func (s *Server) Get(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Values[key]
+}
+
+func (s *Server) WriteLog() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.Writes...)
 }
 
 func New(values map[string]string) *Server { return &Server{Values: values} }
@@ -145,8 +159,12 @@ func (s *Server) handle(args []string) string {
 		if _, ok := s.Values[key]; !ok || s.Writable != nil && !s.Writable[key] {
 			return "ERR: element not found"
 		}
+		old := s.Values[key]
 		s.Values[key] = rest[1]
 		s.Writes = append(s.Writes, key+"="+rest[1])
+		if s.OnWrite != nil {
+			s.OnWrite(s.Values, key, old, rest[1])
+		}
 		if strings.Contains(rest[0], "Timer.") {
 			return "empty"
 		}

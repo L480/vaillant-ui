@@ -141,7 +141,8 @@ Die UI nutzt eine JSON-API, die sich auch für eigene Automationen eignet:
 | `GET /healthz` | Health-Check |
 
 Einfache Endpunkte, z. B. für Homebridge: `GET /status` (Heizung an = `1`), `GET /pump-status`,
-`POST /on`, `/off`, `/auto`, `/party`, `/ventilation`.
+`POST /on`, `/off`, `/auto`, `/party`, `/ventilation`. `/on` und `/off` prüfen per `z1ActualRoomTempDesired`, ob der Regler
+umgeschaltet hat, und erzwingen sonst einmal den Wechsel über den Gegenmodus; `/status` meldet `1`, solange er trotz „Aus“ heizt.
 
 ## Entwicklung
 
